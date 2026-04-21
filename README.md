@@ -1,2 +1,10 @@
-# chainlink-cre-bootcamp
-Minha jornada no CRE Bootcamp da Chainlink — Construindo workflows onchain com o Chainlink Runtime Environment
+# 🔗 Chainlink CRE Bootcamp
+
+> Minha jornada aprendendo a construir workflows onchain com o **Chainlink Runtime Environment (CRE)**
+
+## 👤 Sobre
+
+**Participante:** Constantino Esper (Tino)  
+**Curso:** CRE Bootcamp — Chainlink  
+**Rede:** Ethereum Sepolia (Testnet)  
+**Linguagem:** TypeScript
