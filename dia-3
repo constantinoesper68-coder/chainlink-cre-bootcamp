@@ -1,0 +1,337 @@
+# CRE Bootcamp 2026 — Dia 3
+## Liquidação de Mercado com IA
+
+| Campo | Informação |
+|-------|------------|
+| **Participante** | Constantino Esper (Tino) |
+| **Data** | 23 de Abril de 2026 |
+| **Curso** | Téc. Desenvolvimento de Sistemas — Senai |
+| **Contrato** | 0xf548d2EDc1F480C9a6f23De83A516d71bB116860 |
+| **Rede** | Ethereum Sepolia Testnet |
+| **GitHub** | https://github.com/constantinoesper68-coder/chainlink-cre-bootcamp |
+
+---
+
+## Resumo do Dia 3
+
+No Dia 3 do CRE Bootcamp completamos o mercado de previsão com o workflow de liquidação. Aprendemos a usar **Log Triggers** para reagir a eventos on-chain, **EVM Read** para ler dados de smart contracts, **HTTP Capability** para chamar o Gemini AI, e **EVM Write** para liquidar o mercado com o resultado determinado pela IA.
+
+---
+
+## Arquitetura do Fluxo Completo
+
+```
+requestSettlement() → evento SettlementRequested
+              │
+              ▼
+       CRE Log Trigger
+              │
+    ┌─────────┼──────────┐
+    ▼         ▼          ▼
+EVM Read   Gemini AI  EVM Write
+(dados do  (decide o  (liquida o
+ mercado)  resultado)  mercado)
+```
+
+| Etapa | Capability | Descrição |
+|-------|-----------|-----------|
+| 1 | Log Trigger | Detecta evento SettlementRequested on-chain |
+| 2 | EVM Read | Lê dados do mercado do smart contract |
+| 3 | HTTP (Gemini AI) | Determina o resultado da pergunta |
+| 4 | EVM Write | Escreve a liquidação na blockchain |
+
+---
+
+## Verificação do Ambiente
+
+### Atualização do CRE CLI
+```bash
+cre update
+# ✅ CRE CLI atualizado para v1.12.0
+```
+
+### Carregar variáveis e verificar mercado
+```bash
+source .env
+export MARKET_ADDRESS=0xf548d2EDc1F480C9a6f23De83A516d71bB116860
+
+cast call $MARKET_ADDRESS \
+  "getMarket(uint256) returns ((address,uint48,uint48,bool,uint16,uint8,uint256,uint256,string))" \
+  0 \
+  --rpc-url "https://ethereum-sepolia-rpc.publicnode.com"
+```
+
+**Resultado:** Mercado `"Will Argentina win the 2022 World Cup?"` encontrado — ainda não liquidado.
+
+---
+
+## Etapa 1 — Log Trigger
+
+O Log Trigger permite que o workflow reaja automaticamente a eventos emitidos por smart contracts na blockchain, sem necessidade de polling. Quando alguém chama `requestSettlement()`, o contrato emite o evento `SettlementRequested` e o CRE detecta automaticamente.
+
+### Conceitos
+
+| Padrão | Log Trigger | CRON Trigger |
+|--------|------------|--------------|
+| **Quando** | Evento on-chain emitido | Agendamento |
+| **Tipo** | Reativo | Proativo |
+| **Exemplo** | Liquidação solicitada → Liquidar | A cada hora → Verificar |
+
+### Arquivo criado: `my-workflow/logCallback.ts` (versão inicial)
+
+```typescript
+import { type Runtime, type EVMLog, bytesToHex } from "@chainlink/cre-sdk";
+import { decodeEventLog, parseAbi } from "viem";
+
+const EVENT_ABI = parseAbi([
+  "event SettlementRequested(uint256 indexed marketId, string question)",
+]);
+
+export function onLogTrigger(runtime: Runtime<Config>, log: EVMLog): string {
+  const topics = log.topics.map((t: Uint8Array) => bytesToHex(t)) as [
+    `0x${string}`, ...`0x${string}`[]
+  ];
+  const data = bytesToHex(log.data);
+  const decodedLog = decodeEventLog({ abi: EVENT_ABI, data, topics });
+
+  const marketId = decodedLog.args.marketId as bigint;
+  const question = decodedLog.args.question as string;
+
+  runtime.log(`Settlement requested for Market #${marketId}`);
+  runtime.log(`Question: "${question}"`);
+
+  return "Processed";
+}
+```
+
+### Arquivo atualizado: `my-workflow/main.ts`
+
+```typescript
+import { cre, Runner, getNetwork, hexToBase64 } from "@chainlink/cre-sdk";
+import { keccak256, toHex } from "viem";
+import { onHttpTrigger } from "./httpCallback";
+import { onLogTrigger } from "./logCallback";
+
+const SETTLEMENT_REQUESTED_SIGNATURE = "SettlementRequested(uint256,string)";
+
+const initWorkflow = (config: Config) => {
+  const httpCapability = new cre.capabilities.HTTPCapability();
+  const httpTrigger = httpCapability.trigger({});
+
+  const network = getNetwork({
+    chainFamily: "evm",
+    chainSelectorName: config.evms[0].chainSelectorName,
+    isTestnet: true,
+  });
+
+  const evmClient = new cre.capabilities.EVMClient(network.chainSelector.selector);
+  const eventHash = keccak256(toHex(SETTLEMENT_REQUESTED_SIGNATURE));
+
+  return [
+    cre.handler(httpTrigger, onHttpTrigger),
+    cre.handler(
+      evmClient.logTrigger({
+        addresses: [hexToBase64(config.evms[0].marketAddress as `0x${string}`)],
+        topics: [{ values: [hexToBase64(eventHash)] }],
+        confidence: "CONFIDENCE_LEVEL_FINALIZED",
+      }),
+      onLogTrigger
+    ),
+  ];
+};
+```
+
+### Transação requestSettlement (teste)
+```
+0x315e0560cfac16bf3ac3fd2efc9b128cec72635e4ff4664f87f5994346de656f
+```
+
+### Resultado da Simulação ✅
+```
+[USER LOG] Settlement requested for Market #0
+[USER LOG] Question: "Will Argentina win the 2022 World Cup?"
+✅ Workflow Simulation Result: "Processed"
+```
+
+---
+
+## Etapa 2 — EVM Read
+
+O EVM Read (`callContract`) permite leitura de dados de smart contracts via funções `view/pure`. As leituras são executadas em múltiplos nós da DON com consenso BFT — sem gastar gas.
+
+### `logCallback.ts` atualizado com EVM Read
+
+```typescript
+// Step 2: Read market details (EVM Read)
+const evmConfig = runtime.config.evms[0];
+const network = getNetwork({
+  chainFamily: "evm",
+  chainSelectorName: evmConfig.chainSelectorName,
+  isTestnet: true,
+});
+
+const evmClient = new cre.capabilities.EVMClient(network.chainSelector.selector);
+
+const callData = encodeFunctionData({
+  abi: GET_MARKET_ABI,
+  functionName: "getMarket",
+  args: [marketId],
+});
+
+const readResult = evmClient
+  .callContract(runtime, {
+    call: encodeCallMsg({
+      from: zeroAddress,
+      to: evmConfig.marketAddress as `0x${string}`,
+      data: callData,
+    }),
+  })
+  .result();
+
+const market = decodeFunctionResult({
+  abi: GET_MARKET_ABI,
+  functionName: "getMarket",
+  data: bytesToHex(readResult.data),
+}) as Market;
+```
+
+### Resultado da Simulação ✅
+```
+[USER LOG] Settlement requested for Market #0
+[USER LOG] Question: "Will Argentina win the 2022 World Cup?"
+[USER LOG] Creator: 0x15fC6ae953E024d975e77382eEeC56A9101f9F88
+[USER LOG] Already settled: false
+[USER LOG] Yes Pool: 0
+[USER LOG] No Pool: 0
+✅ Workflow Simulation Result: "Success"
+```
+
+---
+
+## Etapa 3 — HTTP Capability + Gemini AI
+
+### Arquivos criados/atualizados
+
+| Arquivo | Ação | Descrição |
+|---------|------|-----------|
+| `secrets.yaml` | Verificado | GEMINI_API_KEY → GEMINI_API_KEY_VAR |
+| `workflow.yaml` | Atualizado | secrets-path: ../secrets.yaml |
+| `gemini.ts` | Criado | Integração Gemini com prompt de fact-checking |
+| `config.staging.json` | Atualizado | geminiModel: gemini-2.5-flash |
+
+> **Nota:** O modelo `gemini-2.0-flash` não estava mais disponível para novos usuários. Após testes com outros modelos, o `gemini-2.5-flash` com API `v1` funcionou corretamente.
+
+### `my-workflow/workflow.yaml`
+```yaml
+staging-settings:
+  user-workflow:
+    workflow-name: "my-workflow-staging"
+  workflow-artifacts:
+    workflow-path: "./main.ts"
+    config-path: "./config.staging.json"
+    secrets-path: "../secrets.yaml"
+```
+
+### `config.staging.json`
+```json
+{
+  "geminiModel": "gemini-2.5-flash",
+  "evms": [
+    {
+      "marketAddress": "0xf548d2EDc1F480C9a6f23De83A516d71bB116860",
+      "chainSelectorName": "ethereum-testnet-sepolia",
+      "gasLimit": "500000"
+    }
+  ]
+}
+```
+
+---
+
+## Etapa 4 — Fluxo Completo com EVM Write
+
+### Previsão feita no mercado
+```bash
+cast send $MARKET_ADDRESS \
+  "predict(uint256,uint8)" 0 0 \
+  --value 0.01ether \
+  --rpc-url "https://ethereum-sepolia-rpc.publicnode.com" \
+  --private-key $CRE_ETH_PRIVATE_KEY
+```
+✅ Apostado **YES (0)** no mercado #0 com **0.01 ETH**
+
+### Simulação final com --broadcast
+```bash
+cre workflow simulate my-workflow --broadcast
+```
+
+### Resultado Final ✅
+```
+[USER LOG] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[USER LOG] CRE Workflow: Log Trigger - Settle Market
+[USER LOG] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[USER LOG] [Step 1] Settlement requested for Market #0
+[USER LOG] [Step 1] Question: "Will Argentina win the 2022 World Cup?"
+[USER LOG] [Step 2] Already settled: false
+[USER LOG] [Step 2] Yes Pool: 10000000000000000
+[USER LOG] [Step 3] AI Result: YES
+[USER LOG] [Step 3] AI Confidence: 100%
+[USER LOG] [Step 4] Writing to contract: 0xf548d2EDc1F480C9a6f23De83A516d71bB116860
+[USER LOG] [Step 4] ✅ Settlement successful!
+✅ Workflow Simulation Result: "Settled: 0x3b72e868e7d6a5d59591a8c8e15b91bac2cb06e6eb2577a776b2266ecdb37f61"
+```
+
+### Resgate dos ganhos
+```bash
+cast send $MARKET_ADDRESS \
+  "claim(uint256)" 0 \
+  --rpc-url "https://ethereum-sepolia-rpc.publicnode.com" \
+  --private-key $CRE_ETH_PRIVATE_KEY
+```
+✅ Ganhos resgatados com sucesso! 🏆
+
+---
+
+## Transações On-Chain do Dia 3
+
+| Ação | Transaction Hash |
+|------|-----------------|
+| requestSettlement (teste) | `0x315e0560cfac16bf3ac3fd2efc9b128cec72635e4ff4664f87f5994346de656f` |
+| predict YES 0.01 ETH | `0xe850745c274580407037303c75460c585953631f0f5ece7321900e922646d04a` |
+| requestSettlement (final) | `0xa28196d0502c07d10c244923b478ab040f8c6b32999c944284641f264a670c43` |
+| Settlement (EVM Write) | `0x3b72e868e7d6a5d59591a8c8e15b91bac2cb06e6eb2577a776b2266ecdb37f61` |
+| claim() — resgate | `0x8b950119fa46323c64c4170889e086862aa4ee3afbdcf25a0db2d54265bbed8d` |
+
+---
+
+## Estado Final do Mercado
+
+| Campo | Valor |
+|-------|-------|
+| **Mercado ID** | #0 |
+| **Pergunta** | Will Argentina win the 2022 World Cup? |
+| **Settled** | true ✅ |
+| **Outcome** | 0 = YES ✅ |
+| **Confidence** | 10000 = 100% |
+| **Yes Pool** | 10000000000000000 wei (0.01 ETH) |
+| **Contrato** | 0xf548d2EDc1F480C9a6f23De83A516d71bB116860 |
+
+---
+
+## Capabilities Aprendidas — Dias 1, 2 e 3
+
+| Dia | Capability | O que construímos |
+|-----|-----------|-------------------|
+| 1 | CRE Basics | Primeiros workflows e transações na Sepolia |
+| 2 | HTTP Trigger | Criação de mercado via requisição de API |
+| 2 | EVM Write | Deploy e escrita no PredictionMarket.sol |
+| 3 | Log Trigger | Detecção automática de eventos on-chain |
+| 3 | EVM Read | Leitura de dados do smart contract |
+| 3 | HTTP Capability | Chamada ao Gemini AI para resultado |
+| 3 | EVM Write (Settlement) | Liquidação do mercado com IA |
+
+---
+
+*CRE Bootcamp 2026 — Chainlink Runtime Environment*  
+*GitHub: https://github.com/constantinoesper68-coder/chainlink-cre-bootcamp*  
+*Rede: Ethereum Sepolia Testnet*
